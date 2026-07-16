@@ -50,22 +50,47 @@ WHATSAPP_TOKEN  = env("WHATSAPP_TOKEN", "whatsapp-access-token", "whatsapp_acces
 PHONE_NUMBER_ID = env("PHONE_NUMBER_ID", "phone-number-id", "phone_number_id")
 VERIFY_TOKEN    = env("VERIFY_TOKEN", "verify-token", "verify_token", default="rainbowpaint_verify")
 OPENROUTER_API_KEY = env("OPENROUTER_API_KEY", "openrouter_api_key")
-MODEL = env("BOT_MODEL", "bot_model", "bot-model", default="meta-llama/llama-3.3-70b-instruct:free")
+# Gemini (Google AI Studio) — separate free pool from OpenRouter, OpenAI-compatible.
+GEMINI_API_KEY = env("GEMINI_API_KEY", "gemini_api_key", "google_api_key")
+GEMINI_BASE_URL = env("GEMINI_BASE_URL", "gemini_base_url",
+                        default="https://generativelanguage.googleapis.com/v1beta/openai")
+# Local Ollama — runs on THIS machine (truly free, never rate-limited). Optional.
+OLLAMA_URL = env("OLLAMA_BASE_URL", "ollama_base_url", default="http://localhost:11434/v1")
+# Primary model lives on whichever provider BOT_MODEL names. We detect provider by
+# prefix: "openrouter:" / "gemini:" / "ollama:" (default openrouter). Keeps the
+# Render env simple — just set BOT_MODEL to e.g. "gemini:gemini-1.5-flash".
+MODEL = env("BOT_MODEL", "bot_model", "bot-model", default="openrouter:meta-llama/llama-3.3-70b-instruct:free")
 
-# Fallback chain. Free models share ONE global rate-limit pool on OpenRouter, so
-# during peak hours ALL free models can 429 at once. The LAST entry is a cheap
-# PAID model that is always available — a guaranteed floor so the customer never
-# gets the "hiccup" message. Primary = whatever you set in BOT_MODEL.
-# Free models verified live 2026-07-16; the paid floor (mistral-nemo) is ~$0.02/1M
-# in / $0.04/1M out (~$0.00001 per reply). Requires OpenRouter account credit.
-# If a free model is retired by OpenRouter (404), just remove it from the list.
+def _split(m):
+    """'provider:model' -> (provider, model). Default provider = openrouter."""
+    if ":" in m and m.split(":", 1)[0] in ("openrouter", "gemini", "ollama"):
+        p, mod = m.split(":", 1)
+        return p, mod
+    return "openrouter", m
+
+# Fallback chain across MULTIPLE providers. Free models on OpenRouter + Gemini
+# share different pools, so combining them survives a throttle on either. Ollama
+# (local) is never rate-limited. The LAST entry is a cheap PAID OpenRouter model
+# (mistral-nemo ~$0.02/1M in) — a guaranteed floor if all free pools are busy
+# AND OpenRouter has credit. Drop any entry whose key isn't configured.
 MODEL_CHAIN = [MODEL] + [m for m in (
-    "meta-llama/llama-3.2-3b-instruct:free",
-    "nousresearch/hermes-3-llama-3.1-405b:free",
-    "nvidia/nemotron-nano-9b-v2:free",
-    "qwen/qwen3-next-80b-a3b-instruct:free",
-    "mistralai/mistral-nemo",          # cheap paid floor — always available
+    "openrouter:meta-llama/llama-3.2-3b-instruct:free",
+    "openrouter:nousresearch/hermes-3-llama-3.1-405b:free",
+    "openrouter:nvidia/nemotron-nano-9b-v2:free",
+    "openrouter:qwen/qwen3-next-80b-a3b-instruct:free",
+    "gemini:gemini-1.5-flash",          # Google's free pool (separate from OpenRouter)
+    "ollama:llama3.2",                  # local, never rate-limited (if Ollama running)
+    "openrouter:mistralai/mistral-nemo",  # cheap paid floor — always available w/ credit
 ) if m != MODEL]
+
+# Trim entries whose provider key/endpoint is unavailable.
+def _usable(m):
+    p, _ = _split(m)
+    if p == "openrouter": return bool(OPENROUTER_API_KEY)
+    if p == "gemini":     return bool(GEMINI_API_KEY)
+    if p == "ollama":     return True  # may still fail at call time; tolerated by fallback
+    return False
+MODEL_CHAIN = [m for m in MODEL_CHAIN if _usable(m)]
 
 GRAPH_URL = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
 
@@ -301,22 +326,38 @@ TOOLS = [
     }
 ]
 
-def _openai_client():
+def _client_for(model_entry):
+    """Return an OpenAI-compatible client for a 'provider:model' chain entry."""
+    p, _ = _split(model_entry)
+    if p == "gemini":
+        return OpenAI(api_key=GEMINI_API_KEY, base_url=GEMINI_BASE_URL)
+    if p == "ollama":
+        return OpenAI(api_key="ollama", base_url=OLLAMA_URL)
     return OpenAI(api_key=OPENROUTER_API_KEY, base_url="https://openrouter.ai/api/v1")
+
+def _model_id(model_entry):
+    return _split(model_entry)[1]
 
 def _is_rate_limit(err):
     """True for transient errors we should retry on: 429 rate-limit, 404
-    'no endpoints' (model removed/dead), 503/timeout. NOT auth/400 (bad key)."""
+    'no endpoints' (model removed/dead), 503/timeout, AND connection errors
+    (Ollama not running, refused, DNS, network down). NOT auth/400 (bad key)."""
     try:
         msg = str(getattr(err, "message", err))
     except Exception:
         msg = str(err)
     low = msg.lower()
     if any(s in low for s in ("429", "404", "no endpoints", "503", "timeout",
-                              "rate", "rate-limited", "temporarily", "unavailable")):
+                              "rate", "rate-limited", "temporarily", "unavailable",
+                              "connection", "refused", "resolve", "network", "error 7",
+                              "name or service", "timed out", "can't connect", "cannot connect")):
         return True
     code = getattr(err, "status_code", None)
     if code in (429, 404, 503):
+        return True
+    # urllib3 / requests style connection errors
+    etype = type(err).__name__.lower()
+    if any(s in etype for s in ("connection", "timeout", "requests")):
         return True
     return False
 
@@ -336,7 +377,7 @@ def llm_reply(wa_id, customer_text):
     """Every reply is generated by the LLM from reasoning. No hardcoded/templated
     text, no keyword gating. Conversation memory + past learnings are injected;
     unknown products are web-verified (never invented)."""
-    if not OPENROUTER_API_KEY or OpenAI is None:
+    if not (OPENROUTER_API_KEY or GEMINI_API_KEY) or OpenAI is None:
         return ("Thanks for messaging Rainbow Paints! Our team will get back to you shortly. "
                 "You can also reach us on wa.me/918072442930")
 
@@ -361,10 +402,10 @@ def llm_reply(wa_id, customer_text):
 
         # ---- Try each model in the fallback chain (primary first) ----
         last_err = None
-        for model in MODEL_CHAIN:
+        for model_entry in MODEL_CHAIN:
             try:
-                client = _openai_client()
-                reply = _llm_agent_pass(client, model, messages, customer_text, ctx)
+                client = _client_for(model_entry)
+                reply = _llm_agent_pass(client, _model_id(model_entry), messages, customer_text, ctx)
                 if reply is not None:
                     # Persist conversation memory
                     append_history(wa_id, "user", customer_text)
@@ -374,7 +415,7 @@ def llm_reply(wa_id, customer_text):
                     return reply
             except Exception as e:
                 if _is_rate_limit(e):
-                    print(f"[llm_reply] {model} rate-limited (429), trying next model…")
+                    print(f"[llm_reply] {model_entry} rate-limited (429), trying next model…")
                     last_err = e
                     continue
                 # Non-rate-limit error: don't burn the chain, surface it
@@ -440,9 +481,10 @@ def _llm_agent_pass(client, model, base_messages, customer_text, ctx):
 def reflect_and_learn(customer_text, reply, ctx, wa_id):
     """After each reply, distill ONE new durable learning (no prices)."""
     try:
-        if not OPENROUTER_API_KEY or OpenAI is None:
+        if not (OPENROUTER_API_KEY or GEMINI_API_KEY) or OpenAI is None:
             return
-        client = _openai_client()
+        last_err = None
+        r = None
         learnings = load_json(LEARNINGS_FILE, [])
         existing = "\n".join(f"- {l['note']}" for l in learnings[-20:]) or "(none)"
         prompt = (
@@ -453,12 +495,11 @@ def reflect_and_learn(customer_text, reply, ctx, wa_id):
             f"CUSTOMER: {customer_text}\nREPLY: {reply}\nPRODUCTS MATCHED: {ctx[:500]}\n\n"
             f"EXISTING LEARNINGS:\n{existing}"
         )
-        last_err = None
-        r = None
-        for model in MODEL_CHAIN:
+        for model_entry in MODEL_CHAIN:
             try:
+                client = _client_for(model_entry)
                 r = client.chat.completions.create(
-                    model=model,
+                    model=_model_id(model_entry),
                     messages=[{"role": "system",
                                "content": "Record concise, durable learnings for a paint store bot. No prices."},
                               {"role": "user", "content": prompt}],
@@ -467,7 +508,7 @@ def reflect_and_learn(customer_text, reply, ctx, wa_id):
                 break
             except Exception as e:
                 if _is_rate_limit(e):
-                    print(f"[reflect_and_learn] {model} rate-limited (429), trying next…")
+                    print(f"[reflect_and_learn] {model_entry} rate-limited (429), trying next…")
                     last_err = e
                     continue
                 last_err = e
