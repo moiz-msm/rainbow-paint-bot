@@ -446,13 +446,28 @@ def reflect_and_learn(customer_text, reply, ctx, wa_id):
             f"CUSTOMER: {customer_text}\nREPLY: {reply}\nPRODUCTS MATCHED: {ctx[:500]}\n\n"
             f"EXISTING LEARNINGS:\n{existing}"
         )
-        r = client.chat.completions.create(
-            model=MODEL,
-            messages=[{"role": "system",
-                       "content": "Record concise, durable learnings for a paint store bot. No prices."},
-                      {"role": "user", "content": prompt}],
-            max_tokens=140, temperature=0.3,
-        )
+        last_err = None
+        r = None
+        for model in MODEL_CHAIN:
+            try:
+                r = client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "system",
+                               "content": "Record concise, durable learnings for a paint store bot. No prices."},
+                              {"role": "user", "content": prompt}],
+                    max_tokens=140, temperature=0.3,
+                )
+                break
+            except Exception as e:
+                if _is_rate_limit(e):
+                    print(f"[reflect_and_learn] {model} rate-limited (429), trying next…")
+                    last_err = e
+                    continue
+                last_err = e
+                break
+        if r is None:
+            print("[reflect_and_learn] all models failed:", last_err)
+            return
         line = r.choices[0].message.content.strip()
         if line and line.upper() != "NONE":
             if not any(_sim(line, l["note"]) for l in learnings[-8:]):
