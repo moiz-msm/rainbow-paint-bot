@@ -52,6 +52,16 @@ VERIFY_TOKEN    = env("VERIFY_TOKEN", "verify-token", "verify_token", default="r
 OPENROUTER_API_KEY = env("OPENROUTER_API_KEY", "openrouter_api_key")
 MODEL = env("BOT_MODEL", "bot_model", "bot-model", default="meta-llama/llama-3.3-70b-instruct:free")
 
+# Fallback chain: if the primary free model is rate-limited (429), automatically
+# try the next free model so the customer still gets a real reply. Primary is
+# whatever you set in BOT_MODEL; the rest are known-free OpenRouter models.
+MODEL_CHAIN = [MODEL] + [m for m in (
+    "google/gemma-2-9b-it:free",
+    "meta-llama/llama-3.1-8b-instruct:free",
+    "mistralai/mistral-7b-instruct:free",
+    "nousresearch/hermes-2-pro-llama-3-8b:free",
+) if m != MODEL]
+
 GRAPH_URL = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
 
 # ---------------------------------------------------------------------------
@@ -289,6 +299,20 @@ TOOLS = [
 def _openai_client():
     return OpenAI(api_key=OPENROUTER_API_KEY, base_url="https://openrouter.ai/api/v1")
 
+def _is_rate_limit(err):
+    """True if the OpenRouter/provider error is a transient 429 rate-limit."""
+    try:
+        msg = str(getattr(err, "message", err))
+    except Exception:
+        msg = str(err)
+    if "429" in msg:
+        return True
+    # OpenAI SDK wraps it in .message; also check status_code attribute
+    code = getattr(err, "status_code", None)
+    if code == 429:
+        return True
+    return False
+
 def _sim(a, b):
     a, b = a.lower(), b.lower()
     if a == b:
@@ -308,8 +332,8 @@ def llm_reply(wa_id, customer_text):
     if not OPENROUTER_API_KEY or OpenAI is None:
         return ("Thanks for messaging Rainbow Paints! Our team will get back to you shortly. "
                 "You can also reach us on wa.me/918072442930")
+
     try:
-        client = _openai_client()
         history = get_history(wa_id)
         ctx = search(customer_text, max_results=20)
         learnings = load_json(LEARNINGS_FILE, [])
@@ -328,57 +352,83 @@ def llm_reply(wa_id, customer_text):
         )
         messages.append({"role": "user", "content": user_msg})
 
-        MAX_ROUNDS = 3
-        searched = False
-        reply = None
-        for _ in range(MAX_ROUNDS):
-            resp = client.chat.completions.create(
-                model=MODEL, messages=messages, tools=TOOLS, tool_choice="auto",
-                max_tokens=600, temperature=0.6,
-            )
-            msg = resp.choices[0].message
-            if getattr(msg, "tool_calls", None):
-                tc_out = []
-                for tc in msg.tool_calls:
-                    tc_out.append({"id": tc.id, "type": "function",
-                                   "function": {"name": tc.function.name,
-                                                "arguments": tc.function.arguments}})
-                    if tc.function.name == "web_search":
-                        args = json.loads(tc.function.arguments or "{}")
-                        result = web_search(args.get("query", customer_text))
-                        searched = True
-                        messages.append({"role": "tool", "content": result, "tool_call_id": tc.id})
-                messages.append({"role": "assistant", "content": msg.content or "", "tool_calls": tc_out})
-                continue
-            reply = msg.content.strip()
-            break
-
-        if reply is None:
-            reply = ("Thanks for your message! I had a small hiccup — our team will confirm shortly. "
-                     "Reach us on wa.me/918072442930")
-
-        # Proactive verification fallback (if model didn't call the tool but the
-        # product isn't truly grounded in our list, web-verify it before replying)
-        if not searched and not product_grounded(customer_text, ctx):
-            verdict = web_search("paint " + customer_text)
-            messages.append({"role": "user", "content":
-                f"WEB VERIFICATION (real product check, NOT our price):\n{verdict}\n\n"
-                f"Now reply honestly using this — if it's a real product we may carry, say we'll confirm "
-                f"price/stock; never invent a price."})
-            resp = client.chat.completions.create(model=MODEL, messages=messages,
-                                                   max_tokens=600, temperature=0.6)
-            reply = resp.choices[0].message.content.strip()
-
-        # Persist conversation memory
-        append_history(wa_id, "user", customer_text)
-        append_history(wa_id, "assistant", reply)
-        # Self-learning (async, doesn't delay the customer)
-        Thread(target=reflect_and_learn, args=(customer_text, reply, ctx, wa_id), daemon=True).start()
-        return reply
-    except Exception as e:
-        print("[llm_reply] error:", e)
+        # ---- Try each model in the fallback chain (primary first) ----
+        last_err = None
+        for model in MODEL_CHAIN:
+            try:
+                client = _openai_client()
+                reply = _llm_agent_pass(client, model, messages, customer_text, ctx)
+                if reply is not None:
+                    # Persist conversation memory
+                    append_history(wa_id, "user", customer_text)
+                    append_history(wa_id, "assistant", reply)
+                    # Self-learning (async, doesn't delay the customer)
+                    Thread(target=reflect_and_learn, args=(customer_text, reply, ctx, wa_id), daemon=True).start()
+                    return reply
+            except Exception as e:
+                if _is_rate_limit(e):
+                    print(f"[llm_reply] {model} rate-limited (429), trying next model…")
+                    last_err = e
+                    continue
+                # Non-rate-limit error: don't burn the chain, surface it
+                print("[llm_reply] error:", e)
+                last_err = e
+                break
+        # All models failed (or non-429 error)
+        print("[llm_reply] all models failed. last_err:", last_err)
         return ("Thanks for your message! I had a small hiccup fetching that — our team will "
                 "confirm shortly. Reach us on wa.me/918072442930")
+    except Exception as e:
+        print("[llm_reply] fatal:", e)
+        return ("Thanks for your message! I had a small hiccup fetching that — our team will "
+                "confirm shortly. Reach us on wa.me/918072442930")
+
+
+def _llm_agent_pass(client, model, base_messages, customer_text, ctx):
+    """Run the agentic tool loop for one model. Returns reply text or None."""
+    messages = list(base_messages)
+    MAX_ROUNDS = 3
+    searched = False
+    reply = None
+    for _ in range(MAX_ROUNDS):
+        resp = client.chat.completions.create(
+            model=model, messages=messages, tools=TOOLS, tool_choice="auto",
+            max_tokens=600, temperature=0.6,
+        )
+        msg = resp.choices[0].message
+        if getattr(msg, "tool_calls", None):
+            tc_out = []
+            for tc in msg.tool_calls:
+                tc_out.append({"id": tc.id, "type": "function",
+                               "function": {"name": tc.function.name,
+                                            "arguments": tc.function.arguments}})
+                if tc.function.name == "web_search":
+                    args = json.loads(tc.function.arguments or "{}")
+                    result = web_search(args.get("query", customer_text))
+                    searched = True
+                    messages.append({"role": "tool", "content": result, "tool_call_id": tc.id})
+            messages.append({"role": "assistant", "content": msg.content or "", "tool_calls": tc_out})
+            continue
+        reply = msg.content.strip()
+        break
+
+    if reply is None:
+        return None
+
+    # Proactive verification fallback (if model didn't call the tool but the
+    # product isn't truly grounded in our list, web-verify it before replying)
+    if not searched and not product_grounded(customer_text, ctx):
+        verdict = web_search("paint " + customer_text)
+        messages.append({"role": "user", "content":
+            f"WEB VERIFICATION (real product check, NOT our price):\n{verdict}\n\n"
+            f"Now reply honestly using this — if it's a real product we may carry, say we'll confirm "
+            f"price/stock; never invent a price."})
+        resp = client.chat.completions.create(model=model, messages=messages,
+                                              max_tokens=600, temperature=0.6)
+        reply = resp.choices[0].message.content.strip()
+    return reply
+
+
 
 def reflect_and_learn(customer_text, reply, ctx, wa_id):
     """After each reply, distill ONE new durable learning (no prices)."""
