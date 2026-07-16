@@ -55,6 +55,18 @@ MODEL = env("BOT_MODEL", "bot_model", "bot-model", default="meta-llama/llama-3.3
 GRAPH_URL = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
 
 # ---------------------------------------------------------------------------
+# GitHub backup of learning state (survives Render deploys / disk resets)
+# Set: GITHUB_TOKEN (a fine-grained PAT with repo write), GITHUB_REPO = owner/name
+# Optional: GITHUB_BRANCH (default main)
+# ---------------------------------------------------------------------------
+GITHUB_TOKEN  = env("GITHUB_TOKEN", "github-token", "github_token")
+GITHUB_REPO   = env("GITHUB_REPO", "github-repo", "github_repo", default="moiz-msm/rainbow-paint-bot")
+GITHUB_BRANCH = env("GITHUB_BRANCH", "github-branch", "github_branch", default="main")
+GITHUB_STATE_FILES = ("learnings.json", "chat_memory.json")
+_SYNC_LOCK = __import__("threading").Lock()
+_last_push = {"t": 0.0}
+
+# ---------------------------------------------------------------------------
 # Persistent files (self-learning). NOTE: Render free tier resets local disk
 # on each NEW DEPLOY — learnings persist across sleeps but not across deploys.
 # (Offer: back learnings.json to GitHub for true persistence.)
@@ -92,6 +104,79 @@ def append_history(wa_id, role, text):
 def clear_history(wa_id):
     _memory.pop(wa_id, None)
     save_json(MEMORY_FILE, _memory)
+
+# ---------------------------------------------------------------------------
+# GitHub sync (pull on boot, push after learn / every 5 min)
+# ---------------------------------------------------------------------------
+def _gh_headers():
+    return {"Authorization": f"Bearer {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github+json",
+            "Content-Type": "application/json"}
+
+def _gh_path(fname):
+    return f"repos/{GITHUB_REPO}/contents/{fname}"
+
+def github_pull_state():
+    """On boot: download learnings.json + chat_memory.json if present in repo."""
+    if not GITHUB_TOKEN:
+        return
+    for fname in GITHUB_STATE_FILES:
+        try:
+            r = requests.get(f"https://api.github.com/{_gh_path(fname)}?ref={GITHUB_BRANCH}",
+                             headers=_gh_headers(), timeout=15)
+            if r.status_code == 200:
+                import base64
+                content = base64.b64decode(r.json()["content"]).decode("utf-8")
+                with open(fname, "w", encoding="utf-8") as f:
+                    f.write(content)
+                if fname == MEMORY_FILE:
+                    global _memory
+                    _memory = json.loads(content)
+                print(f"[gh] pulled {fname}")
+        except Exception as e:
+            print(f"[gh] pull {fname} failed:", e)
+
+def github_push_state(force=False):
+    """Upload learnings.json + chat_memory.json to the repo (best-effort, throttled)."""
+    if not GITHUB_TOKEN:
+        return
+    now = time.time()
+    if not force and now - _last_push["t"] < 60:
+        return
+    with _SYNC_LOCK:
+        _last_push["t"] = now
+        headers = _gh_headers()
+        for fname in GITHUB_STATE_FILES:
+            try:
+                if not os.path.exists(fname):
+                    continue
+                with open(fname, "r", encoding="utf-8") as f:
+                    data = f.read()
+                gr = requests.get(f"https://api.github.com/{_gh_path(fname)}?ref={GITHUB_BRANCH}",
+                                  headers=headers, timeout=15)
+                sha = gr.json().get("sha") if gr.status_code == 200 else None
+                import base64
+                payload = {"message": f"auto: update {fname} ({time.strftime('%Y-%m-%d %H:%M')})",
+                           "content": base64.b64encode(data.encode("utf-8")).decode("ascii"),
+                           "branch": GITHUB_BRANCH}
+                if sha:
+                    payload["sha"] = sha
+                pr = requests.put(f"https://api.github.com/{_gh_path(fname)}",
+                                  headers=headers, json=payload, timeout=15)
+                if pr.status_code in (200, 201):
+                    print(f"[gh] pushed {fname}")
+                else:
+                    print(f"[gh] push {fname} failed:", pr.status_code, pr.text[:120])
+            except Exception as e:
+                print(f"[gh] push {fname} error:", e)
+
+def github_periodic_sync():
+    while True:
+        time.sleep(300)
+        try:
+            github_push_state(force=True)
+        except Exception as e:
+            print("[gh] periodic sync error:", e)
 
 # ---------------------------------------------------------------------------
 # Web verification (keyless DuckDuckGo HTML). Used ONLY to confirm a product/
@@ -326,6 +411,7 @@ def reflect_and_learn(customer_text, reply, ctx, wa_id):
                     learnings = learnings[-400:]
                 save_json(LEARNINGS_FILE, learnings)
                 print("[learn] +", line)
+                github_push_state()  # persist new learning to GitHub
     except Exception as e:
         print("[reflect_and_learn] error:", e)
 
@@ -406,4 +492,8 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print(f"Rainbow Paint WhatsApp bot starting on :{port}")
     print(f"OpenRouter key set: {bool(OPENROUTER_API_KEY)} | WhatsApp token set: {bool(WHATSAPP_TOKEN)}")
+    # Restore learning state from GitHub so it survives deploys/disk resets
+    github_pull_state()
+    if GITHUB_TOKEN:
+        Thread(target=github_periodic_sync, daemon=True).start()
     app.run(host="0.0.0.0", port=port, debug=False)
