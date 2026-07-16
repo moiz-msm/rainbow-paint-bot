@@ -79,7 +79,7 @@ MODEL_CHAIN = [MODEL] + [m for m in (
     "openrouter:nvidia/nemotron-nano-9b-v2:free",
     "openrouter:qwen/qwen3-next-80b-a3b-instruct:free",
     "gemini:gemini-1.5-flash",          # Google's free pool (separate from OpenRouter)
-    "ollama:llama3.2",                  # local, never rate-limited (if Ollama running)
+    "ollama:qwen2.5:0.5b",              # LOCAL default on desktop runs (tiny, fits 8GB RAM)
     "openrouter:mistralai/mistral-nemo",  # cheap paid floor — always available w/ credit
 ) if m != MODEL]
 
@@ -336,17 +336,35 @@ def _client_for(model_entry):
     return OpenAI(api_key=OPENROUTER_API_KEY, base_url="https://openrouter.ai/api/v1")
 
 def _model_id(model_entry):
-    return _split(model_entry)[1]
+    """Strip 'provider:' prefix. For Ollama, ensure an explicit tag exists
+    (the pulled model is 'llama3.2:3b', not bare 'llama3.2')."""
+    p, mid = _split(model_entry)
+    if p == "ollama" and ":" not in mid:
+        return mid + ":3b"
+    return mid
 
-def _is_rate_limit(err):
-    """True for transient errors we should retry on: 429 rate-limit, 404
-    'no endpoints' (model removed/dead), 503/timeout, AND connection errors
-    (Ollama not running, refused, DNS, network down). NOT auth/400 (bad key)."""
+def _is_rate_limit(err, provider="openrouter"):
+    """True for transient errors worth retrying with the NEXT model.
+
+    OpenRouter/Gemini: 429 rate-limit, 404 'no endpoints' (model removed/dead),
+    503/timeout, connection errors -> retry next. NOT auth/400 (bad key).
+    Ollama (local): only connection/timeout errors are transient (server down).
+    A 404 'model not found' is FATAL for that entry -> don't loop, break."""
     try:
         msg = str(getattr(err, "message", err))
     except Exception:
         msg = str(err)
     low = msg.lower()
+    if provider == "ollama":
+        # local model: only down/network errors are retryable; 404 (model missing) is fatal
+        if any(s in low for s in ("connection", "refused", "resolve", "network",
+                                  "error 7", "name or service", "timed out",
+                                  "can't connect", "cannot connect", "503")):
+            return True
+        etype = type(err).__name__.lower()
+        if any(s in etype for s in ("connection", "timeout")):
+            return True
+        return False
     if any(s in low for s in ("429", "404", "no endpoints", "503", "timeout",
                               "rate", "rate-limited", "temporarily", "unavailable",
                               "connection", "refused", "resolve", "network", "error 7",
@@ -355,7 +373,6 @@ def _is_rate_limit(err):
     code = getattr(err, "status_code", None)
     if code in (429, 404, 503):
         return True
-    # urllib3 / requests style connection errors
     etype = type(err).__name__.lower()
     if any(s in etype for s in ("connection", "timeout", "requests")):
         return True
@@ -414,8 +431,8 @@ def llm_reply(wa_id, customer_text):
                     Thread(target=reflect_and_learn, args=(customer_text, reply, ctx, wa_id), daemon=True).start()
                     return reply
             except Exception as e:
-                if _is_rate_limit(e):
-                    print(f"[llm_reply] {model_entry} rate-limited (429), trying next model…")
+                if _is_rate_limit(e, _split(model_entry)[0]):
+                    print(f"[llm_reply] {model_entry} rate-limited/skipped, trying next model…")
                     last_err = e
                     continue
                 # Non-rate-limit error: don't burn the chain, surface it
@@ -507,8 +524,8 @@ def reflect_and_learn(customer_text, reply, ctx, wa_id):
                 )
                 break
             except Exception as e:
-                if _is_rate_limit(e):
-                    print(f"[reflect_and_learn] {model_entry} rate-limited (429), trying next…")
+                if _is_rate_limit(e, _split(model_entry)[0]):
+                    print(f"[reflect_and_learn] {model_entry} rate-limited/skipped, trying next…")
                     last_err = e
                     continue
                 last_err = e
