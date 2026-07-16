@@ -70,7 +70,7 @@ HARD RULES:
 6. "PU paint" from a layman = 2K PU (two-pack), NOT single-pack enamel. If unsure, ASK: surface? (metal/wood/floor) purpose? 1K or 2K?
 7. "Epoxy paint" = coloured epoxy TOPCOAT, not primer. "Epoxy primer" is a different product.
 8. Customer slang translation: "epoxy primer" usually = Berger 610 Coating Grey (2K epoxy); "PU" = 2K PU (MRF Metalcoat / Berger Bergthane / AP 2K PU); "royale"=Royale; "apex"=Apex; "walmasta"=Walmasta; "campus"=Campus; "weathercoat"=WeatherCoat.
-9. NEVER INVENT a price, stock level, or product spec. If the product/price/stock is not in the provided data, send a SHORT holding reply like: "Sure, let me check our latest stock & price and get back to you shortly 😊 You can also reach us on wa.me/918072442930" — then a human takes over. Do NOT auto-follow with fabricated numbers.
+9. NEVER INVENT a price, stock level, or product spec. If the customer NAMES a specific product and it's not in the provided data, send a SHORT holding reply like: "Sure, let me check our latest stock & price and get back to you shortly 😊 You can also reach us on wa.me/918072442930" — then a human takes over. Do NOT auto-follow with fabricated numbers. (A plain greeting like "hi" is NOT a product query — welcome the customer and ask what they need; do not use the holding reply for greetings.)
 10. Keep replies SHORT, friendly, WhatsApp-style (use line breaks, ₹, emojis sparingly). End with a clarifying question to move the sale forward.
 11. Refer customers to browse shades/products: rainbowpaint.in/buy-paint-online , shades at rainbowpaint.in/color/<shade> , visualizer at rainbowpaint.in/visualizer.
 12. Store contact: WhatsApp wa.me/918072442930 , email rainbow_paint@hotmail.com , Coimbatore, open 9am-8pm.
@@ -81,8 +81,18 @@ Always answer in the customer's language if detectable; default English.
 HUMAN_HANDOFF_LINES = ("let me check", "get back to you", "confirm", "check with our team", "revert")
 
 
+import re as _re
+
+GREETING_RE = _re.compile(r"^(hi|hello|hey|hii|hlo|good\s*(morning|afternoon|evening)|namaste|vanakkam|sup|yo)[\s!\.]*$", _re.IGNORECASE)
+
 def llm_reply(customer_text):
     """Call OpenRouter LLM with the product context and return a reply."""
+    # Greeting-only messages: welcome, don't hand off to human.
+    if GREETING_RE.match(customer_text.strip()) or customer_text.strip().lower() in ("hi", "hello", "hey", "hii", "hlo", "namaste", "vanakkam"):
+        return ("👋 Hi! Welcome to *Rainbow Paints & Hardwares*, Coimbatore 🎨\n"
+                "Tell me what you're looking for — interior/exterior paint, primer, PU, epoxy, "
+                "wood/metal finishes — and I'll quote the price (GST extra) from Asian Paints, Berger & MRF.\n"
+                "Or browse 4000+ shades: rainbowpaint.in/color/")
     if not OPENROUTER_API_KEY:
         return ("Sure, let me check our latest price & stock and get back to you shortly 😊 "
                 "You can also reach us on wa.me/918072442930")
