@@ -136,6 +136,27 @@ def looks_like_product_query(text):
         return True
     return bool(re.search(r"\b\d+\s*(lt|ltr|litre|l|kg)\b", t)) or bool(re.search(r"\b\d[pP]\d{3,}\b", text))
 
+
+def product_grounded(customer_text, ctx):
+    """True only if the search results actually match the customer's product
+    terms (not just a stray size token like '20L'). Prevents false positives
+    that would skip web verification for products we don't carry."""
+    if "no matching" in ctx.lower():
+        return False
+    c = customer_text.lower()
+    # extract meaningful tokens: words >=4 chars that are letters, plus brand/SKU tokens
+    toks = set(re.findall(r"[a-z]{4,}|\b\d[pP]\d{3,}\b", c))
+    # drop generic paint words so they don't count as a 'match'
+    generic = {"paint", "primer", "coating", "emulsion", "enamel", "colour", "color",
+               "metal", "wood", "white", "wall", "interior", "exterior", "litre", "liter",
+               "base", "top", "coat", "finish", "for", "the", "and", "ltr", "with"}
+    toks -= generic
+    if not toks:
+        return True  # nothing specific to match; treat as grounded (e.g. 'paint for wall')
+    cl = ctx.lower()
+    # require at least one specific token to appear in results
+    return any(tok in cl for tok in toks)
+
 # ---------------------------------------------------------------------------
 # SALES BRAIN PROMPT
 # ---------------------------------------------------------------------------
@@ -251,8 +272,9 @@ def llm_reply(wa_id, customer_text):
             reply = ("Thanks for your message! I had a small hiccup — our team will confirm shortly. "
                      "Reach us on wa.me/918072442930")
 
-        # Proactive verification fallback (if model didn't call the tool but we should check)
-        if not searched and ("no matching" in ctx.lower()) and looks_like_product_query(customer_text):
+        # Proactive verification fallback (if model didn't call the tool but the
+        # product isn't truly grounded in our list, web-verify it before replying)
+        if not searched and not product_grounded(customer_text, ctx):
             verdict = web_search("paint " + customer_text)
             messages.append({"role": "user", "content":
                 f"WEB VERIFICATION (real product check, NOT our price):\n{verdict}\n\n"
