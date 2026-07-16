@@ -52,14 +52,16 @@ VERIFY_TOKEN    = env("VERIFY_TOKEN", "verify-token", "verify_token", default="r
 OPENROUTER_API_KEY = env("OPENROUTER_API_KEY", "openrouter_api_key")
 MODEL = env("BOT_MODEL", "bot_model", "bot-model", default="meta-llama/llama-3.3-70b-instruct:free")
 
-# Fallback chain: if the primary free model is rate-limited (429), automatically
-# try the next free model so the customer still gets a real reply. Primary is
-# whatever you set in BOT_MODEL; the rest are known-free OpenRouter models.
+# Fallback chain: if the primary free model is rate-limited / returns 404 (dead
+# model), automatically try the next free model so the customer still gets a real
+# reply. Primary is whatever you set in BOT_MODEL. The rest are CURRENTLY-LIVE
+# OpenRouter free models (verified 2026-07-16). Update if OpenRouter retires one.
 MODEL_CHAIN = [MODEL] + [m for m in (
-    "google/gemma-2-9b-it:free",
-    "meta-llama/llama-3.1-8b-instruct:free",
+    "meta-llama/llama-3.2-3b-instruct:free",
+    "nousresearch/hermes-3-llama-3.1-405b:free",
+    "nvidia/nemotron-nano-9b-v2:free",
+    "qwen/qwen3-next-80b-a3b-instruct:free",
     "mistralai/mistral-7b-instruct:free",
-    "nousresearch/hermes-2-pro-llama-3-8b:free",
 ) if m != MODEL]
 
 GRAPH_URL = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
@@ -300,16 +302,18 @@ def _openai_client():
     return OpenAI(api_key=OPENROUTER_API_KEY, base_url="https://openrouter.ai/api/v1")
 
 def _is_rate_limit(err):
-    """True if the OpenRouter/provider error is a transient 429 rate-limit."""
+    """True for transient errors we should retry on: 429 rate-limit, 404
+    'no endpoints' (model removed/dead), 503/timeout. NOT auth/400 (bad key)."""
     try:
         msg = str(getattr(err, "message", err))
     except Exception:
         msg = str(err)
-    if "429" in msg:
+    low = msg.lower()
+    if any(s in low for s in ("429", "404", "no endpoints", "503", "timeout",
+                              "rate", "rate-limited", "temporarily", "unavailable")):
         return True
-    # OpenAI SDK wraps it in .message; also check status_code attribute
     code = getattr(err, "status_code", None)
-    if code == 429:
+    if code in (429, 404, 503):
         return True
     return False
 
