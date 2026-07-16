@@ -52,16 +52,19 @@ VERIFY_TOKEN    = env("VERIFY_TOKEN", "verify-token", "verify_token", default="r
 OPENROUTER_API_KEY = env("OPENROUTER_API_KEY", "openrouter_api_key")
 MODEL = env("BOT_MODEL", "bot_model", "bot-model", default="meta-llama/llama-3.3-70b-instruct:free")
 
-# Fallback chain: if the primary free model is rate-limited / returns 404 (dead
-# model), automatically try the next free model so the customer still gets a real
-# reply. Primary is whatever you set in BOT_MODEL. The rest are CURRENTLY-LIVE
-# OpenRouter free models (verified 2026-07-16). Update if OpenRouter retires one.
+# Fallback chain. Free models share ONE global rate-limit pool on OpenRouter, so
+# during peak hours ALL free models can 429 at once. The LAST entry is a cheap
+# PAID model that is always available — a guaranteed floor so the customer never
+# gets the "hiccup" message. Primary = whatever you set in BOT_MODEL.
+# Free models verified live 2026-07-16; the paid floor (mistral-nemo) is ~$0.02/1M
+# in / $0.04/1M out (~$0.00001 per reply). Requires OpenRouter account credit.
+# If a free model is retired by OpenRouter (404), just remove it from the list.
 MODEL_CHAIN = [MODEL] + [m for m in (
     "meta-llama/llama-3.2-3b-instruct:free",
     "nousresearch/hermes-3-llama-3.1-405b:free",
     "nvidia/nemotron-nano-9b-v2:free",
     "qwen/qwen3-next-80b-a3b-instruct:free",
-    "mistralai/mistral-7b-instruct:free",
+    "mistralai/mistral-nemo",          # cheap paid floor — always available
 ) if m != MODEL]
 
 GRAPH_URL = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
