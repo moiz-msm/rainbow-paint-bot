@@ -1,0 +1,6 @@
+# Local runtime state (regenerated at runtime; not deployed)
+chat_memory.json
+learnings.json
+__pycache__/
+*.pyc
+.env
