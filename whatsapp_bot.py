@@ -40,11 +40,19 @@ from product_search import search
 
 app = Flask(__name__)
 
-WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN", "")
-PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID", "")
-VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "rainbowpaint_verify")
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-MODEL = os.environ.get("BOT_MODEL", "google/gemini-3.1-pro-preview")  # or nemotron etc.
+# Helper: read an env var under several common spellings (Render lowercases/
+# kebab-cases keys). Case/hyphen-insensitive lookup.
+def env(*names, default=""):
+    for n in names:
+        if n in os.environ and os.environ[n] != "":
+            return os.environ[n]
+    return default
+
+WHATSAPP_TOKEN = env("WHATSAPP_TOKEN", "whatsapp-access-token", "whatsapp_access_token")
+PHONE_NUMBER_ID = env("PHONE_NUMBER_ID", "phone-number-id", "phone_number_id")
+VERIFY_TOKEN = env("VERIFY_TOKEN", "verify-token", "verify_token", default="rainbowpaint_verify")
+OPENROUTER_API_KEY = env("OPENROUTER_API_KEY", "openrouter_api_key")
+MODEL = env("BOT_MODEL", "bot_model", "bot-model", default="google/gemini-3.1-pro-preview")
 
 GRAPH_URL = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
 
