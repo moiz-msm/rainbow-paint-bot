@@ -58,7 +58,7 @@ GEMINI_BASE_URL = env("GEMINI_BASE_URL", "gemini_base_url",
 OLLAMA_URL = env("OLLAMA_BASE_URL", "ollama_base_url", default="http://localhost:11434/v1")
 # Primary model lives on whichever provider BOT_MODEL names. We detect provider by
 # prefix: "openrouter:" / "gemini:" / "ollama:" (default openrouter). Keeps the
-# Render env simple — just set BOT_MODEL to e.g. "gemini:gemini-1.5-flash".
+# Render env simple — just set BOT_MODEL to e.g. "gemini:gemini-2.0-flash".
 MODEL = env("BOT_MODEL", "bot_model", "bot-model", default="openrouter:meta-llama/llama-3.3-70b-instruct:free")
 
 def _split(m):
@@ -74,12 +74,12 @@ def _split(m):
 # (mistral-nemo ~$0.02/1M in) — a guaranteed floor if all free pools are busy
 # AND OpenRouter has credit. Drop any entry whose key isn't configured.
 MODEL_CHAIN = [MODEL] + [m for m in (
+    "gemini:gemini-2.0-flash",            # Google free pool (separate from OpenRouter) — primary for quotes
     "openrouter:meta-llama/llama-3.2-3b-instruct:free",
     "openrouter:nousresearch/hermes-3-llama-3.1-405b:free",
     "openrouter:nvidia/nemotron-nano-9b-v2:free",
     "openrouter:qwen/qwen3-next-80b-a3b-instruct:free",
-    "gemini:gemini-1.5-flash",          # Google's free pool (separate from OpenRouter)
-    "ollama:qwen2.5:0.5b",              # LOCAL default on desktop runs (tiny, fits 8GB RAM)
+    "ollama:qwen2.5:0.5b",              # LOCAL offline backup (tiny, fits 8GB RAM); used only if cloud down
     "openrouter:mistralai/mistral-nemo",  # cheap paid floor — always available w/ credit
 ) if m != MODEL]
 
@@ -262,6 +262,31 @@ def looks_like_product_query(text):
     return bool(re.search(r"\b\d+\s*(lt|ltr|litre|l|kg)\b", t)) or bool(re.search(r"\b\d[pP]\d{3,}\b", text))
 
 
+def _price_fact(ctx, customer_text):
+    """Extract the single best price match from search results and return a
+    LOCKED fact string the model must quote. Prevents tiny local models from
+    inventing a price. Returns '' if no grounded price found."""
+    best = None
+    csize = None
+    m = re.search(r"(\d+)\s*(lt|ltr|litre|l|kg|ml)\b", customer_text.lower())
+    if m:
+        csize = m.group(1) + ("L" if m.group(2) in ("lt","ltr","litre","l") else "KG" if m.group(2)=="kg" else "ML")
+    for line in ctx.splitlines():
+        if "₹" not in line:
+            continue
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) < 4:
+            continue
+        brand, product, size, price = parts[0], parts[1], parts[2], parts[3]
+        # prefer the line whose size matches the customer's requested size
+        if csize and csize.upper() in size.upper():
+            best = f"{brand} {product} {size} = {price} (GST extra)"
+            break
+        if best is None:
+            best = f"{brand} {product} {size} = {price} (GST extra)"
+    return best or ""
+
+
 def product_grounded(customer_text, ctx):
     """True only if the search results actually match the customer's product
     terms (not just a stray size token like '20L'). Prevents false positives
@@ -398,9 +423,34 @@ def llm_reply(wa_id, customer_text):
         return ("Thanks for messaging Rainbow Paints! Our team will get back to you shortly. "
                 "You can also reach us on wa.me/918072442930")
 
+    # Pure greeting / chit-chat (no product named): use a PLAIN chat call
+    # (no tool loop). Tiny local models follow this far better than function
+    # calling and won't refuse a simple hello. Still LLM-generated, not templated.
+    if not looks_like_product_query(customer_text):
+        greet_sys = ("You are the WhatsApp assistant for Rainbow Paints & Hardwares, Coimbatore "
+                     "(rainbowpaint.in). Reply warmly and briefly in the customer's language. "
+                     "Welcome them and ask what paint/brand they need (Asian Paints, Berger, MRF). "
+                     "Keep it to 1-2 short lines. No prices needed for a hello.")
+        for model_entry in MODEL_CHAIN:
+            try:
+                client = _client_for(model_entry)
+                reply = _direct_reply(client, _model_id(model_entry), greet_sys, customer_text)
+                if reply and len(reply) > 3:
+                    append_history(wa_id, "user", customer_text)
+                    append_history(wa_id, "assistant", reply)
+                    Thread(target=reflect_and_learn, args=(customer_text, reply, "", wa_id), daemon=True).start()
+                    return reply
+            except Exception as e:
+                if _is_rate_limit(e, _split(model_entry)[0]):
+                    continue
+                break
+        return ("Hi! 👋 Welcome to Rainbow Paints & Hardwares, Coimbatore. "
+                "What paint or brand are you looking for today? (Asian Paints, Berger, MRF)")
+
     try:
         history = get_history(wa_id)
         ctx = search(customer_text, max_results=20)
+        price_fact = _price_fact(ctx, customer_text)
         learnings = load_json(LEARNINGS_FILE, [])
         learnings_ctx = "\n".join(f"- {l['note']}" for l in learnings[-15:]) if learnings else "(none yet)"
         sys_prompt = SYSTEM_PROMPT + "\n\nPAST LEARNINGS (apply automatically, never repeat verbatim):\n" + learnings_ctx
@@ -408,10 +458,20 @@ def llm_reply(wa_id, customer_text):
         messages = [{"role": "system", "content": sys_prompt}]
         for m in history:
             messages.append({"role": m["role"], "content": m["text"]})
-        user_msg = (
-            f"CUSTOMER MESSAGE: {customer_text}\n\n"
-            f"OUR PRICE LIST (dealer price, GST extra) — only use these numbers, never invent:\n{ctx}\n\n"
-            f"Reason about the message and reply naturally. If the customer names a product/brand not in "
+        if price_fact:
+            user_msg = (
+                f"CUSTOMER MESSAGE: {customer_text}\n\n"
+                f"CONFIRMED PRICE (quote this exact number, GST extra — do NOT invent or modify):\n"
+                f"  {price_fact}\n\n"
+                f"OUR FULL PRICE LIST (dealer price, GST extra) for reference:\n{ctx}\n\n"
+                f"Reply naturally using the CONFIRMED PRICE above. If the customer didn't name a size, "
+                f"give the CONFIRMED PRICE and ask which size they want. Never invent a price."
+            )
+        else:
+            user_msg = (
+                f"CUSTOMER MESSAGE: {customer_text}\n\n"
+                f"OUR PRICE LIST (dealer price, GST extra) — only use these numbers, never invent:\n{ctx}\n\n"
+                f"Reason about the message and reply naturally. If the customer names a product/brand not in "
             f"our list, call web_search to verify it's real. If we don't carry it, say so honestly and "
             f"suggest alternatives or offer to check with the store. Never invent a price."
         )
@@ -423,7 +483,8 @@ def llm_reply(wa_id, customer_text):
             try:
                 client = _client_for(model_entry)
                 reply = _llm_agent_pass(client, _model_id(model_entry), messages, customer_text, ctx)
-                if reply is not None:
+                if _reply_ok(reply, price_fact):
+                    reply = _sanitize_reply(reply)
                     # Persist conversation memory
                     append_history(wa_id, "user", customer_text)
                     append_history(wa_id, "assistant", reply)
@@ -475,6 +536,9 @@ def _llm_agent_pass(client, model, base_messages, customer_text, ctx):
             messages.append({"role": "assistant", "content": msg.content or "", "tool_calls": tc_out})
             continue
         reply = msg.content.strip()
+        if not reply:
+            # weak local model returned empty — retry the round instead of breaking
+            continue
         break
 
     if reply is None:
@@ -492,6 +556,63 @@ def _llm_agent_pass(client, model, base_messages, customer_text, ctx):
                                               max_tokens=600, temperature=0.6)
         reply = resp.choices[0].message.content.strip()
     return reply
+
+
+def _sanitize_reply(reply):
+    """Strip any leaked prompt/instruction text the weak local model may echo
+    (e.g. 'CONFIRMED PRICE:', 'CUSTOMER MESSAGE:', 'OUR PRICE LIST:')."""
+    if not reply:
+        return reply
+    lines = reply.splitlines()
+    keep = []
+    drop_kw = ("CONFIRMED PRICE", "CUSTOMER MESSAGE", "OUR PRICE LIST",
+               "OUR FULL PRICE LIST", "REASON ABOUT", "OUR DEALER PRICE")
+    for ln in lines:
+        up = ln.upper()
+        if any(k in up for k in drop_kw):
+            continue
+        keep.append(ln)
+    out = "\n".join(keep).strip()
+    # if everything got dropped, fall back to raw stripped
+    return out if out else reply.strip()
+
+
+def _reply_ok(reply, price_fact):
+    """Quality gate: reject replies that leaked instructions or, when a price
+    is grounded, fail to actually contain it (mis-grounded / invented)."""
+    if not reply or not reply.strip():
+        return False
+    r = _sanitize_reply(reply)
+    if not r:
+        return False
+    up = r.upper()
+    if any(k in up for k in ("CONFIRMED PRICE", "CUSTOMER MESSAGE", "OUR PRICE LIST")):
+        return False
+    if price_fact:
+        # require the grounded price number (integer part) to appear in the reply.
+        # price_fact like "₹8909.0" -> "8909"; reply "₹8909" also -> "8909".
+        m = re.search(r"₹\s*(\d[\d,]*)", price_fact)
+        price_num = m.group(1).replace(",", "") if m else ""
+        if price_num:
+            # allow the reply to quote the same integer digits (ignore .0 / commas)
+            reply_digits = re.sub(r"[^\d]", "", r)
+            if price_num not in reply_digits:
+                return False
+    return True
+    """Plain chat completion (no tool calls). Tiny local models follow a simple
+    chat prompt far more reliably than function-calling, so we use this for
+    greetings / non-product chit-chat where no search is needed."""
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "system", "content": system_prompt},
+                      {"role": "user", "content": customer_text}],
+            max_tokens=300, temperature=0.7,
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        print("[_direct_reply] error:", e)
+        return None
 
 
 
